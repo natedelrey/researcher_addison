@@ -1,4 +1,4 @@
-# main.py  (Scientific Department bot)
+# main.py  (Scientific Department bot, activity tracking fixed)
 
 import discord
 from discord.ext import commands, tasks
@@ -29,15 +29,15 @@ ANNOUNCEMENT_CHANNEL_ID      = getenv_int("ANNOUNCEMENT_CHANNEL_ID")
 LOG_CHANNEL_ID               = getenv_int("LOG_CHANNEL_ID")
 ANNOUNCEMENT_ROLE_ID         = getenv_int("ANNOUNCEMENT_ROLE_ID")
 MANAGEMENT_ROLE_ID           = getenv_int("MANAGEMENT_ROLE_ID")
-DEPARTMENT_ROLE_ID           = getenv_int("DEPARTMENT_ROLE_ID")
-SCIENTIFIC_TRAINEE_ROLE_ID   = getenv_int("SCIENTIFIC_TRAINEE_ROLE_ID")
+DEPARTMENT_ROLE_ID           = getenv_int("DEPARTMENT_ROLE_ID")          # Scientific Department main role
+SCIENTIFIC_TRAINEE_ROLE_ID   = getenv_int("SCIENTIFIC_TRAINEE_ROLE_ID")  # entry role for orientation window
 ORIENTATION_ALERT_CHANNEL_ID = getenv_int("ORIENTATION_ALERT_CHANNEL_ID")
 COMMAND_LOG_CHANNEL_ID       = getenv_int("COMMAND_LOG_CHANNEL_ID", 1416965696230789150)
 ACTIVITY_LOG_CHANNEL_ID      = getenv_int("ACTIVITY_LOG_CHANNEL_ID", 1409646416829354095)
 
 # DB / API
 DATABASE_URL   = os.getenv("DATABASE_URL")
-API_SECRET_KEY = os.getenv("API_SECRET_KEY")  # for /roblox webhook auth
+API_SECRET_KEY = os.getenv("API_SECRET_KEY")  # for /roblox webhook auth (game -> bot)
 
 def _normalize_base(url: str | None) -> str | None:
     if not url:
@@ -47,6 +47,7 @@ def _normalize_base(url: str | None) -> str | None:
         return u.rstrip("/")
     return ("https://" + u).rstrip("/")
 
+# Optional: separate Node service for ranks/removal (unrelated to activity minutes)
 ROBLOX_SERVICE_BASE = _normalize_base(os.getenv("ROBLOX_SERVICE_BASE") or None)
 ROBLOX_REMOVE_URL   = os.getenv("ROBLOX_REMOVE_URL") or None
 if ROBLOX_REMOVE_URL and not ROBLOX_REMOVE_URL.startswith("http"):
@@ -161,7 +162,7 @@ def find_member(discord_id: int) -> discord.Member | None:
             return m
     return None
 
-# === Roblox service helpers ===
+# === Roblox rank/remove service helpers (not used for minutes) ===
 async def _retry(coro_factory, attempts=3, delay=0.8):
     last_exc = None
     for i in range(attempts):
@@ -337,7 +338,7 @@ class SD_BOT(commands.Bot):
                     auto BOOLEAN DEFAULT FALSE
                 );
             ''')
-            # Safety ALTERs
+            # Safety ALTERs (idempotent)
             await connection.execute("ALTER TABLE weekly_task_logs ADD COLUMN IF NOT EXISTS task TEXT;")
             await connection.execute("ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS task TEXT;")
             await connection.execute("UPDATE weekly_task_logs SET task = COALESCE(task, task_type) WHERE task IS NULL;")
@@ -375,78 +376,96 @@ class SD_BOT(commands.Bot):
         except Exception as e:
             print(f"[Slash] Sync failed: {e}")
 
-        # Web server for Roblox integration
+        # --- Web server for Roblox activity integration (fixed port binding) ---
         app = web.Application()
         app.router.add_get('/health', lambda _: web.Response(text='ok', status=200))
         app.router.add_post('/roblox', self.roblox_handler)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', 8080)
-        await site.start()
-        print("[Web] Server up on :8080 (GET /health, POST /roblox).")
 
-    # --- Roblox webhook with activity embeds ---
+        PORT = int(os.getenv("PORT", "8080"))
+        HOST = os.getenv("HOST", "0.0.0.0")
+        site = web.TCPSite(runner, HOST, PORT)
+        await site.start()
+        print(f"[Web] Server up on {HOST}:{PORT} (GET /health, POST /roblox).")
+
+    # --- Roblox webhook with activity embeds (improved validation/logging) ---
     async def roblox_handler(self, request):
         print("[/roblox] hit")
-        if request.headers.get("X-Secret-Key") != API_SECRET_KEY:
-            print("[/roblox] 401 bad secret")
-            return web.Response(status=401)
-        data = await request.json()
+        provided_secret = request.headers.get("X-Secret-Key")
+        if provided_secret != API_SECRET_KEY:
+            print(f"[/roblox] 401 bad secret (got={provided_secret!r}, expected={'<set>' if API_SECRET_KEY else None})")
+            return web.Response(status=401, text="unauthorized")
+
+        try:
+            data = await request.json()
+        except Exception as e:
+            print(f"[/roblox] bad json: {e}")
+            return web.Response(status=400, text="bad json")
+
         roblox_id = data.get("robloxId")
         status = data.get("status")
-        print(f"[/roblox] body: {data}")
+        print(f"[/roblox] body: {data} (robloxId={roblox_id}, status={status})")
 
+        if not isinstance(roblox_id, int) or status not in {"joined", "left"}:
+            print("[/roblox] invalid payload keys (need int robloxId + status in {'joined','left'})")
+            return web.Response(status=400, text="invalid payload")
+
+        # map roblox_id -> discord_id
         async with self.db_pool.acquire() as connection:
             discord_id = await connection.fetchval(
                 "SELECT discord_id FROM roblox_verification WHERE roblox_id = $1", roblox_id
             )
 
-        if discord_id:
-            if status == "joined":
-                async with self.db_pool.acquire() as connection:
-                    await connection.execute(
-                        "INSERT INTO roblox_sessions (roblox_id, start_time) VALUES ($1, $2) "
-                        "ON CONFLICT (roblox_id) DO UPDATE SET start_time = $2",
-                        roblox_id, utcnow()
-                    )
-                member = find_member(int(discord_id))
-                name = member.display_name if member else f"User {discord_id}"
-                await send_activity_embed(
-                    "🟢 Joined Site",
-                    f"**{name}** started a session.",
-                    discord.Color.green()
+        if not discord_id:
+            print(f"[/roblox] robloxId {roblox_id} not linked; ignoring")
+            return web.Response(status=200, text="ok")  # ignore silently
+
+        if status == "joined":
+            async with self.db_pool.acquire() as connection:
+                await connection.execute(
+                    "INSERT INTO roblox_sessions (roblox_id, start_time) VALUES ($1, $2) "
+                    "ON CONFLICT (roblox_id) DO UPDATE SET start_time = $2",
+                    roblox_id, utcnow()
+                )
+            member = find_member(int(discord_id))
+            name = member.display_name if member else f"User {discord_id}"
+            await send_activity_embed(
+                "🟢 Joined Site",
+                f"**{name}** started a session.",
+                discord.Color.green()
+            )
+            return web.Response(status=200, text="ok")
+
+        # status == "left"
+        session_start = None
+        async with self.db_pool.acquire() as connection:
+            session_start = await connection.fetchval(
+                "SELECT start_time FROM roblox_sessions WHERE roblox_id = $1", roblox_id
+            )
+            if session_start:
+                await connection.execute("DELETE FROM roblox_sessions WHERE roblox_id = $1", roblox_id)
+                duration = (utcnow() - session_start).total_seconds()
+                await connection.execute(
+                    "INSERT INTO roblox_time (member_id, time_spent) VALUES ($1, $2) "
+                    "ON CONFLICT (member_id) DO UPDATE SET time_spent = roblox_time.time_spent + $2",
+                    discord_id, int(duration)
                 )
 
-            elif status == "left":
-                session_start = None
-                async with self.db_pool.acquire() as connection:
-                    session_start = await connection.fetchval(
-                        "SELECT start_time FROM roblox_sessions WHERE roblox_id = $1", roblox_id
-                    )
-                    if session_start:
-                        await connection.execute("DELETE FROM roblox_sessions WHERE roblox_id = $1", roblox_id)
-                        duration = (utcnow() - session_start).total_seconds()
-                        await connection.execute(
-                            "INSERT INTO roblox_time (member_id, time_spent) VALUES ($1, $2) "
-                            "ON CONFLICT (member_id) DO UPDATE SET time_spent = roblox_time.time_spent + $2",
-                            discord_id, int(duration)
-                        )
-
-                mins = int((utcnow() - session_start).total_seconds() // 60) if session_start else 0
-                async with self.db_pool.acquire() as connection:
-                    total_seconds = await connection.fetchval(
-                        "SELECT time_spent FROM roblox_time WHERE member_id=$1", discord_id
-                    ) or 0
-                weekly_minutes = total_seconds // 60
-                member = find_member(int(discord_id))
-                name = member.display_name if member else f"User {discord_id}"
-                await send_activity_embed(
-                    "🔴 Left Site",
-                    f"**{name}** ended their session. Time this session: **{mins} min**.\nThis week: **{weekly_minutes}/{WEEKLY_TIME_REQUIREMENT} min**",
-                    discord.Color.red()
-                )
-
-        return web.Response(status=200)
+        mins = int((utcnow() - session_start).total_seconds() // 60) if session_start else 0
+        async with self.db_pool.acquire() as connection:
+            total_seconds = await connection.fetchval(
+                "SELECT time_spent FROM roblox_time WHERE member_id=$1", discord_id
+            ) or 0
+        weekly_minutes = total_seconds // 60
+        member = find_member(int(discord_id))
+        name = member.display_name if member else f"User {discord_id}"
+        await send_activity_embed(
+            "🔴 Left Site",
+            f"**{name}** ended their session. Time this session: **{mins} min**.\nThis week: **{weekly_minutes}/{WEEKLY_TIME_REQUIREMENT} min**",
+            discord.Color.red()
+        )
+        return web.Response(status=200, text="ok")
 
 bot = SD_BOT()
 
@@ -554,7 +573,7 @@ async def announce(interaction: discord.Interaction, color: str = "blue"):
     color_obj = getattr(discord.Color, color, discord.Color.blue)()
     await interaction.response.send_modal(AnnouncementForm(color_obj=color_obj))
 
-# /log (modal) — now numbers Cross/Anomaly tests
+# /log (modal) — numbers Cross/Anomaly tests
 class LogTaskForm(discord.ui.Modal, title='Add Comments (optional)'):
     def __init__(self, proof: discord.Attachment, task_type: str):
         super().__init__()
@@ -623,7 +642,7 @@ class LogTaskForm(discord.ui.Modal, title='Add Comments (optional)'):
 async def log(interaction: discord.Interaction, task_type: str, proof: discord.Attachment):
     await interaction.response.send_modal(LogTaskForm(proof=proof, task_type=task_type))
 
-# /viewtest — pick a member, test type, and number to view that specific test
+# /viewtest — pick test type + number (member optional)
 @bot.tree.command(name="viewtest", description="View a specific Cross-Testing or Anomaly Testing log by number.")
 @app_commands.choices(test_type=[
     app_commands.Choice(name="Cross-Testing", value="Cross-Testing"),
