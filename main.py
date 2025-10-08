@@ -29,10 +29,8 @@ ANNOUNCEMENT_CHANNEL_ID      = getenv_int("ANNOUNCEMENT_CHANNEL_ID")
 LOG_CHANNEL_ID               = getenv_int("LOG_CHANNEL_ID")
 ANNOUNCEMENT_ROLE_ID         = getenv_int("ANNOUNCEMENT_ROLE_ID")
 MANAGEMENT_ROLE_ID           = getenv_int("MANAGEMENT_ROLE_ID")
-AA_CHANNEL_ID                = getenv_int("AA_CHANNEL_ID")
-ANOMALY_ACTORS_ROLE_ID       = getenv_int("ANOMALY_ACTORS_ROLE_ID")
 DEPARTMENT_ROLE_ID           = getenv_int("DEPARTMENT_ROLE_ID")
-SCIENTIFIC_TRAINEE_ROLE_ID   = getenv_int("SCIENTIFIC_TRAINEE_ROLE_ID")  # renamed from MEDICAL_STUDENT_ROLE_ID
+SCIENTIFIC_TRAINEE_ROLE_ID   = getenv_int("SCIENTIFIC_TRAINEE_ROLE_ID")
 ORIENTATION_ALERT_CHANNEL_ID = getenv_int("ORIENTATION_ALERT_CHANNEL_ID")
 COMMAND_LOG_CHANNEL_ID       = getenv_int("COMMAND_LOG_CHANNEL_ID", 1416965696230789150)
 ACTIVITY_LOG_CHANNEL_ID      = getenv_int("ACTIVITY_LOG_CHANNEL_ID", 1409646416829354095)
@@ -54,7 +52,7 @@ ROBLOX_REMOVE_URL   = os.getenv("ROBLOX_REMOVE_URL") or None
 if ROBLOX_REMOVE_URL and not ROBLOX_REMOVE_URL.startswith("http"):
     ROBLOX_REMOVE_URL = "https://" + ROBLOX_REMOVE_URL
 ROBLOX_REMOVE_SECRET = os.getenv("ROBLOX_REMOVE_SECRET") or None
-ROBLOX_GROUP_ID      = os.getenv("ROBLOX_GROUP_ID") or None  # optional, forwarded if present
+ROBLOX_GROUP_ID      = os.getenv("ROBLOX_GROUP_ID") or None  # optional
 
 # Rank manager role (can run /rank)
 RANK_MANAGER_ROLE_ID = getenv_int("RANK_MANAGER_ROLE_ID", 1405979816120942702)
@@ -77,6 +75,7 @@ TASK_TYPES = [
     "Scientific Department Recruitment",
     "SCP Presentations",
 ]
+TEST_TYPES = {"Cross-Testing", "Anomaly Testing"}  # numbered
 
 # Plurals to make /viewtasks tidy
 TASK_PLURALS = {
@@ -282,7 +281,8 @@ class SD_BOT(commands.Bot):
                     task_type TEXT,
                     proof_url TEXT,
                     comments TEXT,
-                    timestamp TIMESTAMPTZ
+                    timestamp TIMESTAMPTZ,
+                    sequence_no INT
                 );
             ''')
             await connection.execute('''
@@ -293,7 +293,8 @@ class SD_BOT(commands.Bot):
                     task_type TEXT,
                     proof_url TEXT,
                     comments TEXT,
-                    timestamp TIMESTAMPTZ
+                    timestamp TIMESTAMPTZ,
+                    sequence_no INT
                 );
             ''')
             await connection.execute('''
@@ -341,6 +342,8 @@ class SD_BOT(commands.Bot):
             await connection.execute("ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS task TEXT;")
             await connection.execute("UPDATE weekly_task_logs SET task = COALESCE(task, task_type) WHERE task IS NULL;")
             await connection.execute("UPDATE task_logs SET task = COALESCE(task, task_type) WHERE task IS NULL;")
+            await connection.execute("ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS sequence_no INT;")
+            await connection.execute("ALTER TABLE weekly_task_logs ADD COLUMN IF NOT EXISTS sequence_no INT;")
             await connection.execute("ALTER TABLE orientations ADD COLUMN IF NOT EXISTS passed_at TIMESTAMPTZ;")
             await connection.execute("ALTER TABLE orientations ADD COLUMN IF NOT EXISTS warned_5d BOOLEAN DEFAULT FALSE;")
             await connection.execute("ALTER TABLE orientations ADD COLUMN IF NOT EXISTS expired_handled BOOLEAN DEFAULT FALSE;")
@@ -551,7 +554,7 @@ async def announce(interaction: discord.Interaction, color: str = "blue"):
     color_obj = getattr(discord.Color, color, discord.Color.blue)()
     await interaction.response.send_modal(AnnouncementForm(color_obj=color_obj))
 
-# /log (modal)
+# /log (modal) — now numbers Cross/Anomaly tests
 class LogTaskForm(discord.ui.Modal, title='Add Comments (optional)'):
     def __init__(self, proof: discord.Attachment, task_type: str):
         super().__init__()
@@ -570,28 +573,38 @@ class LogTaskForm(discord.ui.Modal, title='Add Comments (optional)'):
         comments_str = self.comments.value or "No comments"
 
         async with bot.db_pool.acquire() as conn:
-            # permanent + weekly + counter
-            await conn.execute(
-                "INSERT INTO task_logs (member_id, task, task_type, proof_url, comments, timestamp) "
-                "VALUES ($1, $2, $3, $4, $5, $6)",
-                member_id, self.task_type, self.task_type, self.proof.url, comments_str, utcnow()
-            )
-            await conn.execute(
-                "INSERT INTO weekly_task_logs (member_id, task, task_type, proof_url, comments, timestamp) "
-                "VALUES ($1, $2, $3, $4, $5, $6)",
-                member_id, self.task_type, self.task_type, self.proof.url, comments_str, utcnow()
-            )
-            await conn.execute(
-                "INSERT INTO weekly_tasks (member_id, tasks_completed) VALUES ($1, 1) "
-                "ON CONFLICT (member_id) DO UPDATE SET tasks_completed = weekly_tasks.tasks_completed + 1",
-                member_id
-            )
-            tasks_completed = await conn.fetchval("SELECT tasks_completed FROM weekly_tasks WHERE member_id = $1", member_id)
+            async with conn.transaction():
+                seq_no = None
+                if self.task_type in TEST_TYPES:
+                    current = await conn.fetchval(
+                        "SELECT COUNT(*) FROM task_logs WHERE member_id=$1 AND task_type=$2",
+                        member_id, self.task_type
+                    ) or 0
+                    seq_no = current + 1
 
-        full_description = f"**Task Type:** {self.task_type}\n\n**Comments:**\n{comments_str}"
+                # permanent + weekly + counter
+                await conn.execute(
+                    "INSERT INTO task_logs (member_id, task, task_type, proof_url, comments, timestamp, sequence_no) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    member_id, self.task_type, self.task_type, self.proof.url, comments_str, utcnow(), seq_no
+                )
+                await conn.execute(
+                    "INSERT INTO weekly_task_logs (member_id, task, task_type, proof_url, comments, timestamp, sequence_no) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    member_id, self.task_type, self.task_type, self.proof.url, comments_str, utcnow(), seq_no
+                )
+                await conn.execute(
+                    "INSERT INTO weekly_tasks (member_id, tasks_completed) VALUES ($1, 1) "
+                    "ON CONFLICT (member_id) DO UPDATE SET tasks_completed = weekly_tasks.tasks_completed + 1",
+                    member_id
+                )
+                tasks_completed = await conn.fetchval("SELECT tasks_completed FROM weekly_tasks WHERE member_id = $1", member_id)
+
+        label_suffix = f" #{seq_no}" if seq_no else ""
+        full_description = f"**Task Type:** {self.task_type}{label_suffix}\n\n**Comments:**\n{comments_str}"
         await send_long_embed(
             target=log_channel,
-            title="✅ Task Logged",
+            title=f"✅ Task Logged — {self.task_type}{label_suffix}",
             description=full_description,
             color=discord.Color.green(),
             footer_text=f"Member ID: {member_id}",
@@ -599,7 +612,7 @@ class LogTaskForm(discord.ui.Modal, title='Add Comments (optional)'):
             author_icon_url=interaction.user.avatar.url if interaction.user.avatar else None,
             image_url=self.proof.url
         )
-        await log_action("Task Logged", f"User: {interaction.user.mention}\nType: **{self.task_type}**")
+        await log_action("Task Logged", f"User: {interaction.user.mention}\nType: **{self.task_type}{label_suffix}**")
         await interaction.response.send_message(
             f"Your task has been logged! You have completed {tasks_completed} task(s) this week.",
             ephemeral=True
@@ -609,6 +622,55 @@ class LogTaskForm(discord.ui.Modal, title='Add Comments (optional)'):
 @app_commands.choices(task_type=[app_commands.Choice(name=t, value=t) for t in TASK_TYPES])
 async def log(interaction: discord.Interaction, task_type: str, proof: discord.Attachment):
     await interaction.response.send_modal(LogTaskForm(proof=proof, task_type=task_type))
+
+# /viewtest — pick a member, test type, and number to view that specific test
+@bot.tree.command(name="viewtest", description="View a specific Cross-Testing or Anomaly Testing log by number.")
+@app_commands.choices(test_type=[
+    app_commands.Choice(name="Cross-Testing", value="Cross-Testing"),
+    app_commands.Choice(name="Anomaly Testing", value="Anomaly Testing"),
+])
+async def viewtest(
+    interaction: discord.Interaction,
+    test_type: str,
+    number: app_commands.Range[int, 1, 10000],
+    member: discord.Member | None = None
+):
+    target = member or interaction.user
+    async with bot.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT task_type, proof_url, comments, timestamp, sequence_no "
+            "FROM task_logs WHERE member_id=$1 AND task_type=$2 AND sequence_no=$3",
+            target.id, test_type, number
+        )
+        if not row:
+            max_n = await conn.fetchval(
+                "SELECT COALESCE(MAX(sequence_no),0) FROM task_logs WHERE member_id=$1 AND task_type=$2",
+                target.id, test_type
+            ) or 0
+    if not row:
+        if max_n == 0:
+            await interaction.response.send_message(
+                f"No **{test_type}** logs found for {target.display_name}.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"{target.display_name} has **{max_n}** {TASK_PLURALS.get(test_type, test_type+'s')}. "
+                f"Number **{number}** doesn’t exist.",
+                ephemeral=True
+            )
+        return
+
+    title = f"{test_type} #{row['sequence_no']} — {target.display_name}"
+    desc = (
+        f"**Member:** {target.mention}\n"
+        f"**Logged:** {row['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"**Comments:** {row['comments'] or '—'}"
+    )
+    embed = discord.Embed(title=title, description=desc, color=discord.Color.blurple(), timestamp=utcnow())
+    if row['proof_url']:
+        embed.set_image(url=row['proof_url'])
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # /mytasks
 @bot.tree.command(name="mytasks", description="Check your weekly tasks and time.")
@@ -654,7 +716,7 @@ async def viewtasks(interaction: discord.Interaction, member: discord.Member | N
     await log_action("Viewed Tasks", f"Requester: {interaction.user.mention}\nTarget: {target.mention if target != interaction.user else 'self'}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# /addtask (mgmt)
+# /addtask (mgmt) — numbers Cross/Anomaly tests across batch
 @bot.tree.command(name="addtask", description="(Mgmt) Add tasks to a member's history and weekly totals.")
 @app_commands.checks.has_role(MANAGEMENT_ROLE_ID)
 @app_commands.choices(task_type=[app_commands.Choice(name=t, value=t) for t in TASK_TYPES])
@@ -672,16 +734,29 @@ async def addtask(
 
     async with bot.db_pool.acquire() as conn:
         async with conn.transaction():
-            batch_rows = [(member.id, task_type, task_type, proof_url, comments_val, now)] * count
+            rows_to_insert = []
+            start_n = None
+            if task_type in TEST_TYPES:
+                current = await conn.fetchval(
+                    "SELECT COUNT(*) FROM task_logs WHERE member_id=$1 AND task_type=$2",
+                    member.id, task_type
+                ) or 0
+                start_n = current + 1
+                for i in range(count):
+                    seq_no = start_n + i
+                    rows_to_insert.append((member.id, task_type, task_type, proof_url, comments_val, now, seq_no))
+            else:
+                rows_to_insert = [(member.id, task_type, task_type, proof_url, comments_val, now, None)] * count
+
             await conn.executemany(
-                "INSERT INTO task_logs (member_id, task, task_type, proof_url, comments, timestamp) "
-                "VALUES ($1, $2, $3, $4, $5, $6)",
-                batch_rows
+                "INSERT INTO task_logs (member_id, task, task_type, proof_url, comments, timestamp, sequence_no) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                rows_to_insert
             )
             await conn.executemany(
-                "INSERT INTO weekly_task_logs (member_id, task, task_type, proof_url, comments, timestamp) "
-                "VALUES ($1, $2, $3, $4, $5, $6)",
-                batch_rows
+                "INSERT INTO weekly_task_logs (member_id, task, task_type, proof_url, comments, timestamp, sequence_no) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                rows_to_insert
             )
             await conn.execute(
                 "INSERT INTO weekly_tasks (member_id, tasks_completed) VALUES ($1, $2) "
@@ -701,12 +776,18 @@ async def addtask(
         label = TASK_PLURALS.get(base, base + ("s" if not base.endswith("s") else ""))
         lines.append(f"{label} — {r['cnt']}")
 
-    desc = f"Added **{count}× {task_type}** to {member.mention}.\n\n**Now totals:**\n" + "\n".join(lines)
+    suffix = ""
+    if task_type in TEST_TYPES and count == 1:
+        suffix = f" #{start_n}"
+    elif task_type in TEST_TYPES and count > 1:
+        suffix = f" #{start_n}–#{start_n + count - 1}"
+
+    desc = f"Added **{count}× {task_type}{suffix}** to {member.mention}.\n\n**Now totals:**\n" + "\n".join(lines)
     embed = discord.Embed(title="✅ Tasks Added", description=desc, color=discord.Color.green(), timestamp=utcnow())
     if proof_url:
         embed.set_image(url=proof_url)
 
-    await log_action("Tasks Added", f"By: {interaction.user.mention}\nMember: {member.mention}\nType: **{task_type}** × {count}")
+    await log_action("Tasks Added", f"By: {interaction.user.mention}\nMember: {member.mention}\nType: **{task_type}** × {count}{suffix}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # /leaderboard
@@ -752,7 +833,7 @@ async def removelastlog(interaction: discord.Interaction, member: discord.Member
     async with bot.db_pool.acquire() as conn:
         async with conn.transaction():
             last_log = await conn.fetchrow(
-                "SELECT log_id, task FROM weekly_task_logs WHERE member_id = $1 ORDER BY timestamp DESC LIMIT 1",
+                "SELECT log_id, task, task_type, sequence_no FROM weekly_task_logs WHERE member_id = $1 ORDER BY timestamp DESC LIMIT 1",
                 member_id
             )
             if not last_log:
@@ -764,9 +845,10 @@ async def removelastlog(interaction: discord.Interaction, member: discord.Member
                 member_id
             )
             new_count = await conn.fetchval("SELECT tasks_completed FROM weekly_tasks WHERE member_id = $1", member_id)
-    await log_action("Removed Last Weekly Task", f"By: {interaction.user.mention}\nMember: {member.mention}\nRemoved: **{last_log['task']}**")
+    suffix = f" #{last_log['sequence_no']}" if last_log['task_type'] in TEST_TYPES and last_log['sequence_no'] else ""
+    await log_action("Removed Last Weekly Task", f"By: {interaction.user.mention}\nMember: {member.mention}\nRemoved: **{last_log['task']}{suffix}**")
     await interaction.response.send_message(
-        f"Removed last weekly task for {member.mention}: '{last_log['task']}'. They now have {new_count} tasks.",
+        f"Removed last weekly task for {member.mention}: '{last_log['task']}{suffix}'. They now have {new_count} tasks.",
         ephemeral=True
     )
 
@@ -792,60 +874,6 @@ async def welcome(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed)
     await log_action("Welcome Sent", f"By: {interaction.user.mention} • Channel: {interaction.channel.mention}")
     await interaction.response.send_message("Welcome message sent!", ephemeral=True)
-
-# /dm (mgmt)
-@bot.tree.command(name="dm", description="Sends a direct message to a member.")
-@app_commands.checks.has_role(MANAGEMENT_ROLE_ID)
-async def dm(interaction: discord.Interaction, member: discord.Member, title: str, message: str):
-    if member.bot:
-        await interaction.response.send_message("You can't send messages to bots!", ephemeral=True)
-        return
-    description = message.replace('\\n', '\n')
-    try:
-        await send_long_embed(
-            target=member,
-            title=f"💌 {title}",
-            description=description,
-            color=discord.Color.magenta(),
-            footer_text=f"A message from {interaction.guild.name}"
-        )
-        await log_action("DM Sent", f"From: {interaction.user.mention}\nTo: {member.mention}\nTitle: **{title}**")
-        await interaction.response.send_message(f"Your message has been sent to {member.mention}!", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message(f"I couldn't message {member.mention}. They might have DMs disabled.", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message("An unexpected error occurred.", ephemeral=True)
-        print(f"DM command error: {e}")
-
-# /aa (mgmt, cooldown) — still useful for scheduling tests with actors
-@bot.tree.command(name="aa", description="Ping Anomaly Actors to get on-site for testing.")
-@app_commands.checks.has_role(MANAGEMENT_ROLE_ID)
-@app_commands.checks.cooldown(1, 300.0, key=lambda i: i.user.id)
-async def aa(interaction: discord.Interaction, note: str | None = None):
-    target_channel = bot.get_channel(AA_CHANNEL_ID)
-    if not target_channel:
-        await interaction.response.send_message("Could not find the AA announcement channel.", ephemeral=True)
-        return
-
-    role = interaction.guild.get_role(ANOMALY_ACTORS_ROLE_ID)
-    if not role:
-        await interaction.response.send_message("Could not find the Anomaly Actors role.", ephemeral=True)
-        return
-
-    title = "🔬 Anomaly Actors Testing Call"
-    body = [
-        f"{role.mention}, please get on-site for **scientific testing** (checkups/interviews/cross-tests).",
-        "Check the radio for further instructions."
-    ]
-    if note:
-        body.append(f"\n**Note:** {note}")
-
-    embed = discord.Embed(title=title, description="\n".join(body), color=discord.Color.purple(), timestamp=utcnow())
-    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
-
-    await target_channel.send(content=f"{role.mention}", embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
-    await log_action("AA Ping Sent", f"By: {interaction.user.mention}\nChannel: {target_channel.mention}")
-    await interaction.response.send_message("Anomaly Actors have been pinged for testing.", ephemeral=True)
 
 # --- Orientation helpers/commands ---
 
